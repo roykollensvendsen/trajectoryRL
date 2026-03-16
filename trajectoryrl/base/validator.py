@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import yaml
 from collections import defaultdict
@@ -38,7 +39,7 @@ from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
-from ..utils.status_reporter import heartbeat, submit_eval
+from ..utils.status_reporter import heartbeat, pre_eval, submit_eval
 from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
 from .. import __version__
 
@@ -47,9 +48,12 @@ logger = logging.getLogger(__name__)
 OWNER_UID = 74
 BURN_FRACTION = 0.50  # 50% of miner emissions burned via owner UID
 EVAL_START_BLOCK = 0
-# TODO: Set SHADOW_MODE = False for official mainnet launch.
 # Shadow mode runs real evals and logs results, but always sets weights to owner UID 74.
 SHADOW_MODE = False
+
+_EVAL_CACHE_MAX_RETRIES = int(os.getenv("TRAJECTORYRL_CACHE_MAX_RETRIES", "3"))
+_EVAL_CACHE_TTL_DAYS = int(os.getenv("TRAJECTORYRL_CACHE_TTL_DAYS", "14"))
+_EVAL_CACHE_ENABLED = os.getenv("TRAJECTORYRL_EVAL_CACHE_ENABLED", "1") != "0"
 
 
 class TrajectoryValidator:
@@ -170,6 +174,10 @@ class TrajectoryValidator:
         # Timestamp of the most recent successful set_weights call
         self._last_set_weights_at: Optional[int] = None
 
+        # Timestamp of the most recent completed full evaluation cycle
+        self._last_eval_at: Optional[int] = None
+
+
         # Last computed weights, cached for mid-eval tempo replays
         self._last_weights_uids: Optional[List[int]] = None
         self._last_weights: Optional[List[float]] = None
@@ -186,6 +194,12 @@ class TrajectoryValidator:
 
         # Load persisted EMA state
         self._load_ema_state()
+
+        # Eval result cache: pack_hash -> {status, result, failure_count, ...}
+        # Keyed by miner-submitted pack_hash; avoids re-running ClawBench + LLM
+        # judge for packs that have already been evaluated this cycle.
+        self._eval_cache: Dict[str, dict] = {}
+        self._load_eval_cache()
 
         logger.info("Validator initialization complete!")
 
@@ -253,6 +267,124 @@ class TrajectoryValidator:
             )
         except Exception as e:
             logger.warning(f"Failed to save EMA state: {e}")
+
+    # ------------------------------------------------------------------
+    # Eval result cache
+    # ------------------------------------------------------------------
+
+    @property
+    def _eval_cache_path(self) -> Path:
+        return self.config.ema_state_path.parent / "eval_cache.json"
+
+    def _load_eval_cache(self):
+        """Load eval result cache from disk, pruning expired entries."""
+        if not _EVAL_CACHE_ENABLED:
+            return
+        path = self._eval_cache_path
+        if not path.exists():
+            logger.info("No eval cache found, starting fresh")
+            return
+        try:
+            data = json.loads(path.read_text())
+            cutoff = time.time() - _EVAL_CACHE_TTL_DAYS * 86400
+            self._eval_cache = {
+                k: v for k, v in data.items()
+                if v.get("last_eval_at", 0) > cutoff
+            }
+            pruned = len(data) - len(self._eval_cache)
+            logger.info(
+                f"Loaded eval cache: {len(self._eval_cache)} entries"
+                + (f" (pruned {pruned} expired)" if pruned else "")
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load eval cache: {e}")
+
+    def _save_eval_cache(self):
+        """Persist eval result cache to disk."""
+        if not _EVAL_CACHE_ENABLED:
+            return
+        try:
+            self._eval_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._eval_cache_path.write_text(
+                json.dumps(self._eval_cache, indent=2, sort_keys=True)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save eval cache: {e}")
+
+    def _check_eval_cache(self, pack_hash: str) -> Tuple[bool, Optional[Dict]]:
+        """Check whether a cached eval result can be reused for pack_hash.
+
+        Returns:
+            (should_use_cache, cached_result)
+            - (True, result_dict)  success hit — use result directly
+            - (True, None)         failed hit, max retries reached — treat as None
+            - (False, None)        no usable cache — run full evaluation
+        """
+        if not _EVAL_CACHE_ENABLED:
+            return False, None
+
+        entry = self._eval_cache.get(pack_hash)
+        if entry is None:
+            logger.debug(f"[EVAL_CACHE] MISS pack_hash={pack_hash[:12]}")
+            return False, None
+
+        if entry["status"] == "success":
+            logger.info(f"[EVAL_CACHE] HIT  pack_hash={pack_hash[:12]} status=success")
+            return True, entry["result"]
+
+        # status == "failed"
+        failure_count = entry.get("failure_count", 1)
+        if failure_count >= _EVAL_CACHE_MAX_RETRIES:
+            logger.info(
+                f"[EVAL_CACHE] SKIP pack_hash={pack_hash[:12]} status=failed "
+                f"failure_count={failure_count}/{_EVAL_CACHE_MAX_RETRIES} "
+                f"(max retries reached)"
+            )
+            return True, None
+
+        logger.info(
+            f"[EVAL_CACHE] HIT  pack_hash={pack_hash[:12]} status=failed "
+            f"failure_count={failure_count}/{_EVAL_CACHE_MAX_RETRIES} (retrying)"
+        )
+        return False, None
+
+    def _update_eval_cache(
+        self,
+        pack_hash: str,
+        eval_result: Optional[Dict],
+        failure_reason: Optional[str] = None,
+    ):
+        """Write or update the eval cache entry for pack_hash.
+
+        On success, stores the full result dict and resets failure_count.
+        On failure, increments failure_count (capped behaviour handled by
+        _check_eval_cache on the next call).
+        """
+        if not _EVAL_CACHE_ENABLED:
+            return
+        now = time.time()
+        existing = self._eval_cache.get(pack_hash)
+        first_eval_at = existing["first_eval_at"] if existing else now
+
+        if eval_result is not None:
+            self._eval_cache[pack_hash] = {
+                "status": "success",
+                "result": eval_result,
+                "failure_count": 0,
+                "first_eval_at": first_eval_at,
+                "last_eval_at": now,
+                "failure_reason": None,
+            }
+        else:
+            prev_count = existing.get("failure_count", 0) if existing else 0
+            self._eval_cache[pack_hash] = {
+                "status": "failed",
+                "result": None,
+                "failure_count": prev_count + 1,
+                "first_eval_at": first_eval_at,
+                "last_eval_at": now,
+                "failure_reason": failure_reason,
+            }
 
     # ------------------------------------------------------------------
     # EMA update
@@ -391,6 +523,7 @@ class TrajectoryValidator:
                 await heartbeat(
                     self.wallet,
                     last_set_weights_at=self._last_set_weights_at,
+                    last_eval_at=self._last_eval_at,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
@@ -445,7 +578,11 @@ class TrajectoryValidator:
                     )
                     logger.info("=" * 60)
 
+                    # Sync ClawBench to latest before evaluation
+                    await self._sync_clawbench()
+
                     await self._run_evaluation_cycle(current_block)
+                    self._last_eval_at = int(time.time())
                     last_eval_sync_block = self.subtensor.get_current_block()
                     self.last_weight_block = last_eval_sync_block
 
@@ -453,6 +590,7 @@ class TrajectoryValidator:
                         self.config.pack_cache_max_size
                     )
                     self._save_ema_state()
+                    self._save_eval_cache()
 
                 # --- Tempo cadence: re-set weights ---
                 current_block = self.subtensor.get_current_block()
@@ -470,10 +608,56 @@ class TrajectoryValidator:
             except KeyboardInterrupt:
                 logger.info("Received interrupt, shutting down...")
                 self._save_ema_state()
+                self._save_eval_cache()
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    # ------------------------------------------------------------------
+    # ClawBench auto-sync
+    # ------------------------------------------------------------------
+
+    async def _sync_clawbench(self) -> None:
+        """Pull latest ClawBench from GitHub before evaluation.
+
+        If the clawbench directory is a git repo (set up by entrypoint),
+        does a fast-forward pull from origin/main.  On any failure, logs
+        a warning and continues with the current version.
+        """
+        clawbench_path = self.config.clawbench_path
+        if not (clawbench_path / ".git").exists():
+            logger.debug(
+                "ClawBench .git not found at %s — skipping auto-sync",
+                clawbench_path,
+            )
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", "origin", "main",
+                cwd=str(clawbench_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30
+            )
+            if proc.returncode == 0:
+                result = stdout.decode().strip()
+                if "Already up to date" not in result:
+                    logger.info("ClawBench updated: %s", result)
+                else:
+                    logger.debug("ClawBench already up to date")
+            else:
+                logger.warning(
+                    "ClawBench sync failed (rc=%d): %s",
+                    proc.returncode,
+                    stderr.decode().strip(),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("ClawBench sync timed out (30s) — using current version")
+        except Exception as e:
+            logger.warning("ClawBench sync error: %s", e)
 
     # ------------------------------------------------------------------
     # LLM key check
@@ -579,32 +763,126 @@ class TrajectoryValidator:
                 )
 
         # 6. Evaluate miners
-        eval_scenarios = sorted(self.scenarios.keys())
+        # Order scenarios hardest-first so weak packs fail fast and we
+        # skip the remaining (cheaper) scenarios, saving LLM tokens.
+        # Difficulty ranking based on empirical pass-rate data.
+        _SCENARIO_DIFFICULTY_ORDER = [
+            "morning_brief",
+            "inbox_to_action",
+            "client_escalation",
+            "team_standup",
+            "inbox_triage",
+        ]
+        eval_scenarios = sorted(
+            self.scenarios.keys(),
+            key=lambda s: (
+                _SCENARIO_DIFFICULTY_ORDER.index(s)
+                if s in _SCENARIO_DIFFICULTY_ORDER
+                else len(_SCENARIO_DIFFICULTY_ORDER)
+            ),
+        )
         evaluated_count = 0
         attempted_count = 0
+        total_eligible = len(active_commitments) - len(skip_uids)
+        total_scenarios = len(eval_scenarios)
+        logger.info(
+            f"=== Eval cycle: {total_eligible} eligible miners, "
+            f"{total_scenarios} scenarios each ==="
+        )
 
+        miner_idx = 0
         for uid, commitment in active_commitments.items():
             hotkey = commitment.hotkey
 
             if uid in skip_uids:
                 continue
 
+            miner_idx += 1
             needs_eval = self._needs_evaluation(
                 hotkey, commitment.pack_hash, current_block
             )
             if not needs_eval:
-                logger.debug(
-                    f"Miner {uid} ({hotkey[:8]}): skipping, "
-                    f"within eval interval"
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
+                    f"skipping, within eval interval"
                 )
                 continue
 
-            attempted_count += 1
-            eval_result = await self._evaluate_miner(
-                uid, commitment, eval_scenarios, epoch_seed,
-                context_preamble, user_context,
-                block_height=current_block,
-            )
+            # Pre-eval gate: ask the server whether this miner's submission
+            # is allowed before spending LLM tokens on a full evaluation.
+            # Controlled by TRAJECTORYRL_PRE_EVAL_ENABLED (default: 1).
+            # Fail-open on network/API errors so validators are self-sufficient.
+            if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
+                pre_eval_result = await pre_eval(
+                    hotkey,
+                    commitment.pack_hash,
+                    commitment.pack_url,
+                )
+                if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
+                    reason = pre_eval_result.get("reason", "unknown")
+                    logger.info(
+                        f"Miner {uid} ({hotkey[:8]}): pre-eval rejected "
+                        f"(reason={reason}) — skipping eval"
+                    )
+                    _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
+                    _detail = (
+                        f"pre-eval rejected: {reason}"
+                        + (
+                            f", banned_until={pre_eval_result['banned_until']}"
+                            if "banned_until" in pre_eval_result
+                            else ""
+                        )
+                    )
+                    asyncio.ensure_future(
+                        submit_eval(
+                            self.wallet,
+                            miner_hotkey=hotkey,
+                            miner_uid=uid,
+                            block_height=current_block,
+                            score=0.0,
+                            ema_score=0.0,
+                            cost=0.0,
+                            ema_cost=0.0,
+                            weight=0.0,
+                            qualified=False,
+                            pack_url=commitment.pack_url,
+                            pack_hash=commitment.pack_hash,
+                            llm_base_url=self._judge_base_url,
+                            llm_model=self._judge_model,
+                            rejected=True,
+                            rejection_stage=_stage,
+                            rejection_detail=_detail,
+                        )
+                    )
+                    continue
+
+            # Check eval cache before spending LLM tokens.
+            # Pre-eval always runs; cache is keyed by pack_hash.
+            cache_hit, cache_result = self._check_eval_cache(commitment.pack_hash)
+            if cache_hit:
+                eval_result = cache_result
+                if cache_result is not None:
+                    logger.info(
+                        f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
+                        f"using cached eval result (pack_hash={commitment.pack_hash[:12]})"
+                    )
+                else:
+                    logger.info(
+                        f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
+                        f"cached failure — max retries reached, skipping eval"
+                    )
+            else:
+                attempted_count += 1
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
+                    f"({hotkey[:8]}) ..."
+                )
+                eval_result = await self._evaluate_miner(
+                    uid, commitment, eval_scenarios, epoch_seed,
+                    context_preamble, user_context,
+                    block_height=current_block,
+                )
+                self._update_eval_cache(commitment.pack_hash, eval_result)
 
             if eval_result is not None:
                 ema_reset = self._ema_pack_hash.get(hotkey) != commitment.pack_hash
@@ -620,6 +898,13 @@ class TrajectoryValidator:
                 )
                 self.last_eval_block[hotkey] = current_block
                 evaluated_count += 1
+                q = eval_result.get("qualified", {})
+                passed = sum(1 for v in q.values() if v)
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} done: "
+                    f"{passed}/{len(q)} scenarios passed "
+                    f"({evaluated_count} evaluated so far)"
+                )
 
                 # Store latest token & model usage for metadata reporting
                 if eval_result.get("token_usage"):
@@ -640,6 +925,13 @@ class TrajectoryValidator:
                     self._update_first_mover(
                         uid, hotkey, total_cost, float(commitment.block_number)
                     )
+
+            else:
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} eval returned None "
+                    f"(pack fetch/integrity failed)"
+                )
+
 
             # Mid-eval tempo refresh: replay the last computed weights so
             # the validator stays active on-chain without exposing partial
@@ -916,7 +1208,12 @@ class TrajectoryValidator:
         scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
         scenario_judge_details: Dict[str, Dict[str, Any]] = {}
 
-        for scenario_name in eval_scenarios:
+        total_scenarios = len(eval_scenarios)
+        for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
+            logger.info(
+                f"Miner {miner_uid}: scenario [{scenario_idx}/{total_scenarios}] "
+                f"{scenario_name} ..."
+            )
             try:
                 # Single episode per scenario (no consensus voting in v4.0)
                 result = await self.harness.evaluate_pack(
@@ -933,7 +1230,15 @@ class TrajectoryValidator:
                         f"{result.error}"
                     )
                     scenario_qualified[scenario_name] = False
-                    continue
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
 
                 if result.cost_usd is not None:
                     scenario_costs[scenario_name] = result.cost_usd
@@ -1010,12 +1315,34 @@ class TrajectoryValidator:
                             f"${m.get('cost_usd', 0):.4f} "
                             f"({m.get('count', 0)} calls)"
                         )
+
+                # Fail fast: any scenario failure → skip remaining
+                if not qualified:
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast on {scenario_name}, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
+
             except Exception as e:
                 logger.error(
                     f"Miner {miner_uid}: {scenario_name} failed: {e}",
                     exc_info=True,
                 )
                 scenario_qualified[scenario_name] = False
+                remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                if remaining:
+                    logger.info(
+                        f"Miner {miner_uid}: fail-fast on {scenario_name} exception, "
+                        f"skipping {len(remaining)} remaining scenarios"
+                    )
+                    for s in remaining:
+                        scenario_qualified[s] = False
+                break
 
         if not scenario_qualified:
             logger.warning(f"Miner {miner_uid}: No scenario results!")
@@ -1173,11 +1500,6 @@ class TrajectoryValidator:
                 # Score = 1.0 if qualified, 0.0 otherwise (for report compat)
                 scores[uid] = 1.0 if is_qualified else 0.0
 
-                total_cost = self.compute_total_cost_from_ema(hotkey)
-                if total_cost is not None:
-                    costs[uid] = total_cost
-                qualified[uid] = self.is_fully_qualified(hotkey)
-
         if not scores:
             logger.warning("All miners have zero EMA score")
             await self._set_fallback_weights()
@@ -1317,29 +1639,78 @@ class TrajectoryValidator:
         except Exception as e:
             logger.error(f"Error replaying weights: {e}", exc_info=True)
 
-    async def _set_fallback_weights(self, reason: str = "No eligible miners"):
-        """Set weights to subnet owner UID when no miners qualify.
+    def _fallback_owner_weights(self) -> Optional[Tuple[list, list]]:
+        """Read on-chain weights set by OWNER_UID and return (uids, weights).
 
-        Miner incentive directed to the owner hotkey is burned by the
-        chain (not paid to the owner), so this effectively burns miner
-        emissions until a qualifying miner submits.  The validator must
-        always call set_weights every tempo to avoid deregistration.
+        Returns None if the owner has no weights or the read fails.
         """
         try:
-            # Verify wallet is accessible before attempting on-chain call
+            self.metagraph.sync(subtensor=self.subtensor)
+            W = self.metagraph.W  # (n, n) weight matrix
+            if OWNER_UID >= W.shape[0]:
+                logger.warning(
+                    f"OWNER_UID {OWNER_UID} out of range (metagraph size {W.shape[0]})"
+                )
+                return None
+
+            owner_weights = W[OWNER_UID]
+            # Extract non-zero entries
+            uids = []
+            weights = []
+            for uid, w in enumerate(owner_weights.tolist()):
+                if w > 0:
+                    uids.append(uid)
+                    weights.append(float(w))
+
+            if not uids:
+                logger.warning(
+                    f"Owner UID {OWNER_UID} has no non-zero weights on chain"
+                )
+                return None
+
+            logger.info(
+                f"Copied {len(uids)} weight entries from owner UID {OWNER_UID}"
+            )
+            return uids, weights
+        except Exception as e:
+            logger.warning(f"Failed to read owner weights from chain: {e}")
+            return None
+
+    def _fallback_to_owner(self) -> Tuple[list, list]:
+        """Return weight=1.0 on OWNER_UID only (burns emissions)."""
+        return [OWNER_UID], [1.0]
+
+    async def _set_fallback_weights(self, reason: str = "No eligible miners"):
+        """Set weights when no miners qualify.
+
+        Fallback order:
+        1. Copy on-chain weights from OWNER_UID (UID 74).
+        2. If that fails, set weight=1.0 to OWNER_UID only (burns emissions).
+
+        The validator must always call set_weights every tempo to avoid
+        deregistration.
+        """
+        try:
             _ = self.wallet.hotkey
         except Exception:
             logger.debug("Skipping fallback weights: wallet hotkey not available")
             return
 
         try:
-            uids = [OWNER_UID]
-            weights = [1.0]
+            copied = self._fallback_owner_weights()
+            if copied is not None:
+                uids, weights = copied
+                logger.info(
+                    f"{reason} — copying weights from owner UID {OWNER_UID} "
+                    f"({len(uids)} entries)"
+                )
+            else:
+                uids, weights = self._fallback_to_owner()
+                logger.info(
+                    f"{reason} — setting fallback weight to "
+                    f"owner UID {OWNER_UID}"
+                )
 
-            logger.info(
-                f"{reason} — setting fallback weight to "
-                f"owner UID {OWNER_UID}"
-            )
             self.subtensor.set_weights(
                 netuid=self.config.netuid,
                 wallet=self.wallet,
@@ -1349,6 +1720,7 @@ class TrajectoryValidator:
                 wait_for_finalization=False,
             )
             logger.info(f"Fallback weights set (owner UID {OWNER_UID})")
+            self._last_set_weights_at = int(time.time())
         except Exception as e:
             logger.error(f"Error setting fallback weights: {e}", exc_info=True)
 
