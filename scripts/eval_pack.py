@@ -194,13 +194,24 @@ async def run(args) -> int:
     logger.info(f"Timeout:   {args.timeout}s/scenario")
 
     # ── 4b. TrajectoryJudge (Phase 2, same as validator) ─────────────────
+    judge_model = (
+        args.judge_model
+        or os.getenv("JUDGE_MODEL")
+        or model
+    )
+    judge_api_key = args.judge_api_key or os.getenv("JUDGE_API_KEY") or api_key
+    judge_base_url = args.judge_base_url or os.getenv("JUDGE_BASE_URL") or base_url
+
     judge = TrajectoryJudge(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        model=judge_model,
+        api_key=judge_api_key,
+        base_url=judge_base_url,
     )
     scenarios_path = clawbench_path / "scenarios"
-    logger.info("Judge:     TrajectoryJudge enabled")
+    if judge_model != model:
+        logger.info(f"Judge:     {judge_model} (separate from agent model)")
+    else:
+        logger.info("Judge:     TrajectoryJudge enabled")
 
     # ── 5. Epoch context ──────────────────────────────────────────────────
     seed = args.seed if args.seed is not None else int(time.time()) % 100000
@@ -402,9 +413,17 @@ def main():
                    help="Epoch seed (default: from current time)")
     p.add_argument("--timeout", type=int, default=120,
                    help="Timeout per scenario (default: 120s)")
-    p.add_argument("--model", help="LLM model override")
+    p.add_argument("--model", help="LLM model override (agent model)")
     p.add_argument("--api-key", help="LLM API key override")
     p.add_argument("--base-url", help="LLM base URL override")
+    p.add_argument("--judge-model",
+                   help="LLM model for trajectory judge (default: same as --model). "
+                        "Use a non-reasoning model if the agent model is a reasoning "
+                        "model like GLM-5-TEE. Also supports JUDGE_MODEL env var.")
+    p.add_argument("--judge-api-key",
+                   help="API key for judge model (default: same as --api-key)")
+    p.add_argument("--judge-base-url",
+                   help="Base URL for judge model (default: same as --base-url)")
     p.add_argument("--clawbench-path", default=str(PROJECT_ROOT / "clawbench"),
                    help="Path to clawbench dir")
     p.add_argument("--workspace", default=None, help="Workspace path override")
