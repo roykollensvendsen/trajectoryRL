@@ -337,6 +337,11 @@ class _EpisodeResult:
     duration_s: float = 0.0
     judge_result: dict = field(default_factory=dict)
     ep_data: dict = field(default_factory=dict)
+    # sn11-v2: raw bytes of /workspace/.sn11_temp_zero copied out of
+    # the sandbox container when SN11_HERMES_TEMP_ZERO_PATCH is set.
+    # Empty when the patch isn't active or the sentinel wasn't
+    # written (i.e. hermes never made a chat-completion call).
+    temp_zero_marker: bytes = b""
 
 
 @dataclass
@@ -474,6 +479,11 @@ class SandboxEvaluationResult:
                 json.dumps(ep.ep_data, indent=2, default=str))
             if ep.error:
                 (ep_dir / "error.txt").write_text(ep.error)
+            # sn11-v2: write temp-zero sentinel into the same dir as
+            # the transcript so the orchestrator's verification can
+            # find it via the standard artifacts/episodes path.
+            if ep.temp_zero_marker:
+                (ep_dir / ".sn11_temp_zero").write_bytes(ep.temp_zero_marker)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,18 +1357,18 @@ class TrajectorySandboxHarness:
         finally:
             # sn11-v2 patch verification: when the temp-zero patch is
             # active, copy the sentinel out of the container BEFORE
-            # teardown so the orchestrator can post-hoc confirm the
-            # override took effect on at least one LLM call.
+            # teardown. Stored on the episode so the later artifact-
+            # writing pass (which is the only thing that knows where
+            # the per-scenario artifacts dir is) can write it next to
+            # the transcript.
             import os as _os
             if sandbox and _os.environ.get("SN11_HERMES_TEMP_ZERO_PATCH"):
                 try:
                     raw = self._extract_file(
                         sandbox, "/workspace/.sn11_temp_zero",
                     )
-                    if raw and episode.artifacts_dir:
-                        marker = (Path(episode.artifacts_dir)
-                                  / ".sn11_temp_zero")
-                        marker.write_bytes(raw)
+                    if raw:
+                        episode.temp_zero_marker = raw
                 except Exception:
                     pass  # verification is best-effort
             if sandbox:
