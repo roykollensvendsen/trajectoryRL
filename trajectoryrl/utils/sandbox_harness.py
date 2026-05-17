@@ -1119,6 +1119,21 @@ class TrajectorySandboxHarness:
 
         sandbox = None
         try:
+            # sn11-v2 patch: if SN11_HERMES_TEMP_ZERO_PATCH points at a
+            # readable file on the host, mount it over hermes' chat-
+            # completions transport so SN11_FORCE_TEMP_ZERO=1 in the
+            # container has somewhere to take effect. Diagnostic-only;
+            # validator runs without this env var see no change.
+            import os as _os
+            _extra_volumes = {}
+            _sn11_env = {}
+            _patch = _os.environ.get("SN11_HERMES_TEMP_ZERO_PATCH", "")
+            if _patch and _os.path.isfile(_patch):
+                _extra_volumes[_os.path.abspath(_patch)] = {
+                    "bind": "/opt/hermes/agent/transports/chat_completions.py",
+                    "mode": "ro",
+                }
+                _sn11_env["SN11_FORCE_TEMP_ZERO"] = "1"
             sandbox = self.client.containers.run(
                 scenario_image,
                 name=f"sandbox_{session_id}_{scenario.replace('/', '_')}",
@@ -1130,7 +1145,9 @@ class TrajectorySandboxHarness:
                     "LLM_API_KEY":  self._testee_api_key,
                     "LLM_BASE_URL": self._testee_api_url,
                     "LLM_MODEL":    self._testee_model,
+                    **_sn11_env,
                 },
+                volumes=_extra_volumes or None,
                 mem_limit="4g", cpu_quota=200000,
                 labels={"trajectoryrl.role": "sandbox",
                         "trajectoryrl.scenario": scenario,
