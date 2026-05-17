@@ -1345,6 +1345,22 @@ class TrajectorySandboxHarness:
                 session_id, scenario, e, exc_info=True,
             )
         finally:
+            # sn11-v2 patch verification: when the temp-zero patch is
+            # active, copy the sentinel out of the container BEFORE
+            # teardown so the orchestrator can post-hoc confirm the
+            # override took effect on at least one LLM call.
+            import os as _os
+            if sandbox and _os.environ.get("SN11_HERMES_TEMP_ZERO_PATCH"):
+                try:
+                    raw = self._extract_file(
+                        sandbox, "/workspace/.sn11_temp_zero",
+                    )
+                    if raw and episode.artifacts_dir:
+                        marker = (Path(episode.artifacts_dir)
+                                  / ".sn11_temp_zero")
+                        marker.write_bytes(raw)
+                except Exception:
+                    pass  # verification is best-effort
             if sandbox:
                 try:
                     sandbox.stop(timeout=5)
